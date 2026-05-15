@@ -1,0 +1,10 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.streamlit/
+.env
+*.xlsx
+*.xlsm
+master_reference.json
+.DS_Store
