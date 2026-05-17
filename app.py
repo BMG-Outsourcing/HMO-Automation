@@ -1904,7 +1904,8 @@ def main():
 
     st.markdown('<div class="upload-label">Upload Billing File (.xlsx / .xlsm)</div>',
                 unsafe_allow_html=True)
-    uploaded = st.file_uploader("", type=["xlsx", "xlsm"], label_visibility="collapsed")
+    uploaded = st.file_uploader("Billing File Upload", type=["xlsx", "xlsm"], label_visibility="collapsed")
+
 
     if not uploaded:
         st.markdown(
@@ -2097,9 +2098,9 @@ def main():
 
         st.markdown('<div class="sec-label">Employee Lookup</div>', unsafe_allow_html=True)
         search = st.text_input(
-            "", placeholder="Search by Id Number or Name…",
-            label_visibility="collapsed", key="lookup",
-        )
+    "Employee Lookup", placeholder="Search by Id Number or Name…",
+    label_visibility="collapsed", key="lookup",
+)
         if search:
             mask = (
                 df["Id Number"].astype(str).str.contains(search, case=False, na=False) |
