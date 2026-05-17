@@ -21,8 +21,7 @@ from copy import copy
 # ─── PATHS ────────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 MASTER_PATH = os.path.join(BASE_DIR, "master_reference.json")
-LOGO_PATH   = r"C:\Users\Ac - IT Intern\HMO-Automation\images\logo.png"
-
+LOGO_PATH = os.path.join(BASE_DIR, "images", "logo.png")
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 HEADER_ROW = 18
 
@@ -1943,11 +1942,12 @@ def main():
             logs.append(f"  Missing : {len(mlog['missing'])}")
             logs.append(f"  Total   : {len(master)}")
 
-            prog.progress(80, text="Building output workbook…")
+            prog.progress(80, text="Building output workbook… (this may take 30s)")
             wb_out    = load_workbook(io.BytesIO(file_bytes), keep_vba=is_xlsm)
             wb_out    = _scrub_workbook(wb_out)
             out_bytes = build_output(wb_out, df, is_xlsm=is_xlsm,
-                                     period_label=period_label)
+            period_label=period_label)
+            prog.progress(95, text="Finalising…")
 
             prog.progress(100, text="Done ✓")
             logs.append("")
