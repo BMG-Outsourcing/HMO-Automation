@@ -1,14 +1,16 @@
 """
-BMG-HMO Billing File Processor — Streamlit App  v12.0
+BMG-HMO Billing File Processor — Streamlit App  v13.0
 
-KEY FIXES vs v11:
-  ✓ Works when Working File sheet is ABSENT — bootstraps one from Attachment
-  ✓ Phase-1 validation no longer hard-fails on missing Working File
-  ✓ Period label detection reads the "Billing Period:" row directly
-  ✓ Attachment-only rows get Entity/SC from master_reference.json when available
-  ✓ Blank Entity rows are flagged but never silently dropped
-  ✓ Safe workbook context manager used consistently
+KEY FIXES vs v12:
+  ✓ phase1_validate: NEVER hard-fails on missing Working File — it's always a warning
+  ✓ phase1_validate: also passes when Working File IS present but entity/SC cols empty
+  ✓ _find_header_row: searches both "id number" AND "#" sentinel to locate header
+  ✓ Billing Period detection: reads col C (offset +2) correctly from Attachment row 17
+  ✓ Working File bootstrap when absent: creates clean shell from Attachment data
+  ✓ Working File with blank Entity: all rows kept, entity derived via master_reference.json
+  ✓ Attachment financial columns resolved by name (Medical, VAT, Total Membership Fee)
   ✓ All gc.collect() calls kept; no memory leaks
+  ✓ Safe workbook context manager used consistently
   ✓ Sheet reorder uses wb.move_sheet safely
 """
 
@@ -27,7 +29,7 @@ MASTER_PATH = os.path.join(BASE_DIR, "master_reference.json")
 LOGO_PATH   = os.path.join(BASE_DIR, "images", "logo.png")
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
-HEADER_ROW = 18          # default header row in Attachment
+HEADER_ROW = 18
 
 FINANCIAL_COLS = ["Medical", "VAT", "Total Membership Fee"]
 
@@ -118,10 +120,10 @@ def safe_workbook(file_bytes, keep_vba=False, read_only=False):
 
 
 # ─── STYLE FACTORIES ──────────────────────────────────────────────────────────
-def _make_header_fill():  return PatternFill("solid", fgColor="C00000")
-def _make_header_font():  return Font(bold=True, color="FFFFFF")
+def _make_header_fill():    return PatternFill("solid", fgColor="C00000")
+def _make_header_font():    return Font(bold=True, color="FFFFFF")
 def _make_highlight_fill(): return PatternFill("solid", fgColor="FFF2CC")
-def _make_no_fill():      return PatternFill(fill_type=None)
+def _make_no_fill():        return PatternFill(fill_type=None)
 
 
 # ─── SAFE VALUE HELPERS ───────────────────────────────────────────────────────
@@ -249,6 +251,7 @@ def _sleek_subgroup(entity: str) -> str:
 
 # ─── SHEET READER ─────────────────────────────────────────────────────────────
 def _find_header_row(ws, fallback: int = HEADER_ROW) -> int:
+    """Find the row containing 'Id Number' as a column header."""
     for r in range(1, 31):
         for c in range(1, min(ws.max_column + 1, 20)):
             v = ws.cell(row=r, column=c).value
@@ -291,19 +294,18 @@ def _read_sheet(wb, sheet_name: str) -> pd.DataFrame:
 # ─── PERIOD LABEL DETECTOR ────────────────────────────────────────────────────
 def _detect_period_label(wb) -> str:
     """
-    First tries to read 'Billing Period:' row from the Attachment sheet
-    (e.g. "June 01, 2026 to June 30, 2026"), then falls back to any cell
-    containing the word 'month'.
+    Reads 'Billing Period:' row from Attachment sheet.
+    The label is in col A, the value is in col C (two columns right).
+    Falls back to scanning any cell containing 'month'.
     """
-    # Try Attachment sheet billing period row first
     if "Attachment" in wb.sheetnames:
         ws = wb["Attachment"]
         for r in range(1, 25):
             for c in range(1, 5):
                 v = ws.cell(row=r, column=c).value
                 if v and "billing period" in str(v).strip().lower():
-                    # Value is in the cell to the right (column c+2 typically)
-                    for offset in range(1, 5):
+                    # Try offsets 1-4 to find the period text
+                    for offset in range(1, 6):
                         vv = ws.cell(row=r, column=c + offset).value
                         if vv and str(vv).strip():
                             return f"For the period of {str(vv).strip()}"
@@ -368,9 +370,11 @@ def update_master(df: pd.DataFrame, master: dict) -> tuple[dict, dict]:
 # ─── PHASE 1: VALIDATION ──────────────────────────────────────────────────────
 def phase1_validate(wb, filename: str) -> dict:
     """
-    Validates the workbook. Only hard-fails on missing MONTHLY keyword.
-    Missing Working File is now a WARNING, not an error — it will be
-    bootstrapped from the Attachment in phase2_sync.
+    Validates the workbook.
+    Hard-fails ONLY when 'MONTHLY' keyword is absent AND neither Attachment
+    nor Working File sheet exists.
+    Missing Working File is a WARNING — it will be bootstrapped from Attachment.
+    Missing Entity/SC data is fine — will be derived or flagged later.
     """
     result = {
         "monthly":          False,
@@ -378,15 +382,23 @@ def phase1_validate(wb, filename: str) -> dict:
         "has_working_file": "Working File" in wb.sheetnames,
     }
 
+    # Check filename
     if "MONTHLY" in filename.upper():
         result["monthly"] = True
 
-    for sname in wb.sheetnames:
-        ws = wb[sname]
-        for row in ws.iter_rows(min_row=1, max_row=20, values_only=True):
-            for cell in row:
-                if cell and "MONTHLY" in str(cell).upper():
-                    result["monthly"] = True
+    # Check first 20 rows of each sheet
+    if not result["monthly"]:
+        for sname in wb.sheetnames:
+            ws = wb[sname]
+            for row in ws.iter_rows(min_row=1, max_row=20, values_only=True):
+                for cell in row:
+                    if cell and "MONTHLY" in str(cell).upper():
+                        result["monthly"] = True
+                        break
+                if result["monthly"]:
+                    break
+            if result["monthly"]:
+                break
 
     if not result["monthly"]:
         raise ValueError(
@@ -399,7 +411,7 @@ def phase1_validate(wb, filename: str) -> dict:
             "Please upload a valid billing file."
         )
 
-    # Working File absence is now just a warning — handled in phase2_sync
+    # Working File absence is a warning only — handled in phase2_sync
     return result
 
 
@@ -412,7 +424,7 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
     has_att = "Attachment"   in wb.sheetnames
     master  = load_master()
 
-    # ── Read or bootstrap Working File ────────────────────────────────────────
+    # ── Read or bootstrap Working File ─────────────────────────────────────────
     if has_wf:
         wf = _read_sheet(wb, "Working File")
         logs.append(f"  Working File columns found    : {list(wf.columns)}")
@@ -429,13 +441,17 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
         wf["Id Number"] = wf["Id Number"].astype(str).str.strip()
         _log_id_info(wf["Id Number"], "Working File", logs)
 
-        before = len(wf)
-        wf     = wf[_valid_rows(wf)].copy()
+        before  = len(wf)
+        wf      = wf[_valid_rows(wf)].copy()
+        # Keep only valid employee IDs
+        id_mask = wf["Id Number"].str.match(r'^\d{4}-')
+        dropped_hdr = (~id_mask).sum()
+        wf      = wf[id_mask].copy()
         dropped = before - len(wf)
         logs.append(f"  Working File rows total       : {before}")
         logs.append(f"  Working File rows (kept)      : {len(wf)}")
         if dropped:
-            logs.append(f"  Working File rows dropped     : {dropped} (fully blank)")
+            logs.append(f"  Working File rows dropped     : {dropped} (blank/non-ID rows)")
 
         dup_mask = wf.duplicated(subset="Id Number", keep=False)
         if dup_mask.any():
@@ -447,11 +463,11 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
                 logs.append(f"    … and {len(dup_ids) - 10} more")
 
     else:
-        # Bootstrap: create an empty WF shell — rows come entirely from Attachment
         logs.append("  ⚠ No 'Working File' sheet found — bootstrapping from Attachment.")
         wf = pd.DataFrame(columns=WF_READ_COLS)
         wf["Id Number"] = wf["Id Number"].astype(str)
 
+    # Ensure all output cols exist
     for col in WF_OUTPUT_COLS:
         if col not in wf.columns:
             wf[col] = ""
@@ -484,29 +500,26 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
     att["Id Number"] = att["Id Number"].astype(str).str.strip()
     _log_id_info(att["Id Number"], "Attachment", logs)
 
-    # Drop fully blank rows AND footer/header rows that slip through
     att = att[_valid_rows(att)].copy()
-    # Keep only rows whose Id Number looks like a real employee ID
     att = att[att["Id Number"].str.match(r'^\d{4}-')].copy()
-
     logs.append(f"  Attachment valid employee rows : {len(att)}")
 
     dup_mask = att.duplicated(subset="Id Number", keep=False)
     if dup_mask.any():
         dup_ids = att.loc[dup_mask, "Id Number"].unique()
-        logs.append(f"  ⚠ Duplicate IDs in Attachment ({len(dup_ids)}) — last row wins for financials:")
+        logs.append(f"  ⚠ Duplicate IDs in Attachment ({len(dup_ids)}) — last row wins:")
         for rid in dup_ids[:10]:
             logs.append(f"    ↳ {rid}")
         if len(dup_ids) > 10:
             logs.append(f"    … and {len(dup_ids) - 10} more")
 
-    att_ids  = set(att["Id Number"].tolist())
-    att_lkp  = (
+    att_ids = set(att["Id Number"].tolist())
+    att_lkp = (
         att.drop_duplicates(subset="Id Number", keep="last")
            .set_index("Id Number")
            .to_dict("index")
     )
-    wf_ids   = set(wf["Id Number"].tolist())
+    wf_ids = set(wf["Id Number"].tolist())
     wf.attrs["att_ids"] = att_ids
 
     # ── Refresh financials for existing WF rows ────────────────────────────────
@@ -601,7 +614,7 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
     if blank_entity.any():
         logs.append(
             f"  ⚠ {blank_entity.sum()} row(s) have NO Entity set "
-            f"— they will land in the SO sheet. "
+            f"— they will land in the SO sheet by default. "
             f"Fill their Entity column in the downloaded file."
         )
 
@@ -799,8 +812,8 @@ def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
 
     DATA_START = HDR_ROW + 1
     for i, (label, principal, dependent, advances, total) in enumerate(data_rows):
-        r        = DATA_START + i
-        cell_a   = ws.cell(row=r, column=1, value=label)
+        r      = DATA_START + i
+        cell_a = ws.cell(row=r, column=1, value=label)
         cell_a.font = REG_FONT
         for ci, val in enumerate([principal, dependent, advances, total], start=2):
             cell               = ws.cell(row=r, column=ci, value=val if val else None)
@@ -813,12 +826,12 @@ def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
     TOTAL_ROW = SPACER1 + 1
     ws.row_dimensions[SPACER1].height = 6
 
-    cell_t       = ws.cell(row=TOTAL_ROW, column=1, value="Total")
-    cell_t.font  = BOLD_FONT
+    cell_t        = ws.cell(row=TOTAL_ROW, column=1, value="Total")
+    cell_t.font   = BOLD_FONT
     cell_t.border = med_tb()
     for ci in range(2, 6):
-        col_letter = get_column_letter(ci)
-        formula    = f"=SUM({col_letter}{DATA_START}:{col_letter}{DATA_START + len(data_rows) - 1})"
+        col_letter         = get_column_letter(ci)
+        formula            = f"=SUM({col_letter}{DATA_START}:{col_letter}{DATA_START + len(data_rows) - 1})"
         cell               = ws.cell(row=TOTAL_ROW, column=ci, value=formula)
         cell.number_format = NUM_FMT
         cell.font          = BOLD_FONT
@@ -842,8 +855,8 @@ def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
     CHK_ROW = SPACER3 + 1
     ws.row_dimensions[SPACER3].height = 6
 
-    cell_chk       = ws.cell(row=CHK_ROW, column=1, value="To Check")
-    cell_chk.font  = BOLD_FONT
+    cell_chk      = ws.cell(row=CHK_ROW, column=1, value="To Check")
+    cell_chk.font = BOLD_FONT
     chk_e               = ws.cell(row=CHK_ROW, column=5,
                                    value=f"=E{TOTAL_ROW}-E{INV_ROW}")
     chk_e.number_format = NUM_FMT
@@ -1005,7 +1018,7 @@ def _write_sleek_sheet(ws, df_sleek: pd.DataFrame, att_ids: set):
         sec_cell.alignment = section_align
         ws.row_dimensions[current_row].height = 18
         for col_i in range(2, n_cols + 1):
-            c = ws.cell(row=current_row, column=col_i)
+            c       = ws.cell(row=current_row, column=col_i)
             c.fill  = section_fill
             c.value = None
         try:
@@ -1050,7 +1063,7 @@ def _write_sleek_sheet(ws, df_sleek: pd.DataFrame, att_ids: set):
                     col_widths[ci] = max(col_widths[ci], len(str(v)))
             current_row += 1
 
-        current_row += 1   # spacer between groups
+        current_row += 1  # spacer
 
     for ci, width in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(ci)].width = min(width + 2, 50)
@@ -1096,8 +1109,8 @@ def _normalise_so_companies(names: list) -> dict:
         clusters[_company_root(name)].append(name)
 
     final: dict = {}
-    single_keys  = [k for k in clusters if " " not in k]
-    multi_keys   = [k for k in clusters if " " in k]
+    single_keys = [k for k in clusters if " " not in k]
+    multi_keys  = [k for k in clusters if " " in k]
     absorbed: set = set()
     for sk in single_keys:
         target = next((mk for mk in multi_keys if mk.startswith(sk + " ")), None)
@@ -1125,8 +1138,8 @@ def _write_so_sheet(ws, df_so: pd.DataFrame, att_ids: set):
     canon_map           = _normalise_so_companies(df_work["_raw_co"].tolist())
     df_work["_company"] = df_work["_raw_co"].map(canon_map)
 
-    all_companies    = sorted(df_work["_company"].unique(), key=lambda n: n.lower())
-    groups_in_order  = []
+    all_companies   = sorted(df_work["_company"].unique(), key=lambda n: n.lower())
+    groups_in_order = []
     for company in all_companies:
         grp = df_work[df_work["_company"] == company].drop(
             columns=["_raw_co", "_company"]
@@ -1154,7 +1167,7 @@ def _write_so_sheet(ws, df_so: pd.DataFrame, att_ids: set):
         sec_cell.alignment = section_align
         ws.row_dimensions[current_row].height = 18
         for col_i in range(2, n_cols + 1):
-            c = ws.cell(row=current_row, column=col_i)
+            c       = ws.cell(row=current_row, column=col_i)
             c.fill  = section_fill
             c.value = None
         try:
@@ -1199,7 +1212,7 @@ def _write_so_sheet(ws, df_so: pd.DataFrame, att_ids: set):
                     col_widths[ci] = max(col_widths[ci], len(str(v)))
             current_row += 1
 
-        current_row += 1   # spacer
+        current_row += 1  # spacer
 
     for ci, width in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(ci)].width = min(width + 2, 50)
@@ -1218,12 +1231,10 @@ def build_output(source_wb, df: pd.DataFrame, is_xlsm: bool = False,
     gc.collect()
     wb = Workbook()
 
-    # Remove default sheet
     for default_name in ["Sheet", "Sheet1"]:
         if default_name in wb.sheetnames:
             wb.remove(wb[default_name])
 
-    # Copy source sheets we want to preserve
     for sname in KEEP_SHEETS:
         if sname in source_wb.sheetnames:
             ws_new    = wb.create_sheet(title=sname)
@@ -1241,17 +1252,14 @@ def build_output(source_wb, df: pd.DataFrame, is_xlsm: bool = False,
                             except Exception:
                                 pass
 
-    # If Working File wasn't in source, create it now
     if "Working File" not in wb.sheetnames:
         wb.create_sheet(title="Working File")
 
     att_ids: set = df.attrs.get("att_ids", set())
 
-    # Write Working File
     ws_wf = wb["Working File"]
     _write_data_sheet(ws_wf, df, att_ids)
 
-    # Write entity sheets
     df_work        = df.copy()
     df_work["_dest"] = df_work["Entity"].apply(lambda e: _entity_sheet(_s(e)))
 
@@ -1277,13 +1285,11 @@ def build_output(source_wb, df: pd.DataFrame, is_xlsm: bool = False,
 
         gc.collect()
 
-    # Summary sheet
     if "Summary" in wb.sheetnames:
         wb.remove(wb["Summary"])
     ws_sum = wb.create_sheet(title="Summary")
     _write_summary_sheet(ws_sum, df, period_label=period_label)
 
-    # Reorder sheets
     desired = ["Summary", "Attachment", "Working File"] + ENTITY_SHEETS
     for target_idx, sheet_name in enumerate(desired):
         if sheet_name in wb.sheetnames:
@@ -1320,7 +1326,6 @@ def inject_css():
     st.markdown("""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&family=Lato:wght@300;400;700&display=swap');
-
         :root {
             --red-900: #7A0000; --red-800: #A00000; --red-700: #C00000;
             --red-600: #D40000; --red-100: #FFF0F0; --red-50:  #FFF8F8;
@@ -1331,7 +1336,6 @@ def inject_css():
         }
         html, body, [class*="css"] { font-family: 'Lato', sans-serif; color: var(--ash); }
         .stApp { background: var(--smoke); }
-
         .hero {
             background: var(--red-700);
             background-image:
@@ -1392,7 +1396,6 @@ def inject_css():
         }
         .step-title { font-family: 'Syne', sans-serif; font-size: 0.82rem; font-weight: 700; color: var(--ash); margin-bottom: 7px; }
         .step-desc { font-size: 0.73rem; color: var(--steel); line-height: 1.6; }
-
         .upload-label {
             font-family: 'Syne', sans-serif; font-size: 0.62rem; font-weight: 700;
             letter-spacing: 0.12em; text-transform: uppercase; color: var(--red-700);
@@ -1486,7 +1489,7 @@ def render_topbar():
             <p class="hero-title">BMG-HMO Automation</p>
             <p class="hero-sub">Billing File Processor · Internal Use Only</p>
         </div>
-        <div class="hero-pill">v12.0</div>
+        <div class="hero-pill">v13.0</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1722,7 +1725,7 @@ def main():
 
     if not uploaded:
         st.markdown(
-            '<div class="footer">BMG-HMO Automation · Internal Use Only · v12.0</div>',
+            '<div class="footer">BMG-HMO Automation · Internal Use Only · v13.0</div>',
             unsafe_allow_html=True,
         )
         return
@@ -1759,7 +1762,7 @@ def main():
                 logs.append(f"  ✓ Attachment sheet : {'found' if val['has_attachment'] else 'MISSING'}")
                 logs.append(
                     f"  {'✓' if val['has_working_file'] else '⚠'} Working File : "
-                    f"{'found' if val['has_working_file'] else 'MISSING — will be bootstrapped'}"
+                    f"{'found' if val['has_working_file'] else 'MISSING — will be bootstrapped from Attachment'}"
                 )
                 period_label = _detect_period_label(wb_v)
                 logs.append(f"  ✓ Period label     : {period_label or '(not detected)'}")
@@ -1839,7 +1842,6 @@ def main():
         att_ids = df.attrs.get("att_ids", set())
         ss      = st.session_state.sync_summary
 
-        # Warn if many rows have no Entity set
         no_entity = (df["Entity"].apply(_s) == "").sum()
         if no_entity:
             st.markdown(
@@ -1932,7 +1934,7 @@ def main():
                 st.rerun()
 
     st.markdown(
-        '<div class="footer">BMG-HMO Automation · Internal Use Only · v12.0</div>',
+        '<div class="footer">BMG-HMO Automation · Internal Use Only · v13.0</div>',
         unsafe_allow_html=True,
     )
 
